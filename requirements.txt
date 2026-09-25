@@ -1,0 +1,11 @@
+numpy
+chromadb
+langchain_core
+langchain_community
+sentence_transformers
+langchain_huggingface
+accelerate
+pypdf
+docx2txt
+python-dotenv
+langchain-openai
