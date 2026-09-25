@@ -20,19 +20,21 @@ from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
 from langchain_core.output_parsers import JsonOutputParser
 from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Costanti
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 BATCH_SIZE = 32
 TOP_K_RETRIEVAL = 8
-MAX_NEW_TOKENS = 4096
+MAX_TOKENS = 4096
 DEVICE_MAP = "auto"
 LOCAL_LLM_MODEL = "Qwen/Qwen2.5-7B-Instruct"
-LLM_API_MODEL = "llama-3.1-8b-instant"
+GROQ_MODEL = "openai/gpt-oss-120b"
 LLM_API_BASE_URL= "https://api.groq.com/openai/v1"
-LLM = "local" # api
 BASE_FOLDER = Path(__file__).resolve().parent
 VECTOR_FOLDER = "./chroma_db"
 COLLECTION_NAME = "datatrust_documents"
@@ -44,6 +46,8 @@ THEMES = {
     "compliance": "rischi di compliance, obblighi normativi, scadenze regolamentari",
     "financial_performance": "risultati finanziari, ricavi, margini, indicatori di performance",
     "strategic_directions": "decisioni strategiche, piani futuri, iniziative di investimento",
+    "Governance":"struttura organizzativa, ruoli e responsabilità, processi decisionali, controlli interni, deleghe e poteri",
+    "Relazioni con i clienti": "relazioni con i clienti, soddisfazione e reclami, fidelizzazione, contratti e accordi commerciali, feedback dal mercato"
 }
 
 CATEGORIES = [
@@ -51,6 +55,7 @@ CATEGORIES = [
     "Performance Finanziaria",
     "Strategia Aziendale",
     "Governance",
+    "Relazioni con i clienti"
 ]
 
 
@@ -93,7 +98,6 @@ class DocumentAnalysis:
     critical_issues: List[str] = field(default_factory=list)
     recommendation: str = ""
     number_of_chunks_analyzed: int = 0
-
 
 # Estrattori
 class Extractor(ABC):
@@ -217,8 +221,7 @@ class EmbeddingManager:
     """
     def __init__(self, model_name: str = EMBEDDING_MODEL_NAME):
         self.model = SentenceTransformer(model_name)
-        self.dimension = self.model.get_sentence_embedding_dimension()
-    
+
     def encode_text(self, texts: List[str], batch_size: int = BATCH_SIZE) -> np.ndarray:
         """Genera gli embedding per i testi forniti in ingresso."""
         if not texts:
@@ -228,16 +231,22 @@ class EmbeddingManager:
             texts,
             batch_size=batch_size
         )
+class LLM(ABC):
+
+    @property
+    def chat_model(self):
+        """Proprietà in sola lettura per accedere al modello Chat di LangChain."""
+        return self._chat
 
 # --- LLM Locale ---
-class LocalLLM:
+class LocalLLM(LLM):
     """Espone un modello chat locale tramite HuggingFacePipeline e ChatHuggingFace."""
 
     def __init__(
         self,
         model_name: str = LOCAL_LLM_MODEL,
         device_map: str = DEVICE_MAP,
-        max_new_tokens: int = MAX_NEW_TOKENS,
+        max_new_tokens: int = MAX_TOKENS,
     ):
         print(f"Caricamento modello locale '{model_name}' (verrà scaricato al primo avvio)...")
 
@@ -255,47 +264,29 @@ class LocalLLM:
         self._chat = ChatHuggingFace(llm=pipeline_hf)
         print("Modello locale pronto.\n")
 
-    @property
-    def chat_model(self):
-        """Proprietà in sola lettura per accedere al modello Chat di LangChain."""
-        return self._chat
 
 # --- LLM via API ---
-class ApiLLM():
+class ApiLLM(LLM):
     """Espone un modello chat remoto tramite un endpoint compatibile OpenAI (Groq, OpenRouter, OpenAI...)."""
 
-    def __init__(
-        self,
-        model_name: str = LLM_API_MODEL,
-        base_url: str = LLM_API_BASE_URL,
-        api_key: str | None = None,
-        max_new_tokens: int = MAX_NEW_TOKENS,
-    ):
-        api_key = api_key or os.getenv("LLM_API_KEY")
-        if not api_key:
-            raise ValueError("Chiave API mancante: imposta la variabile d'ambiente LLM_API_KEY.")
-
-        print(f"Connessione al modello remoto '{model_name}'...")
+    def __init__(self, api_key):
         self._chat = ChatOpenAI(
-            model=model_name,
-            base_url=base_url,
+            model=GROQ_MODEL,
             api_key=api_key,
-            max_tokens=max_new_tokens,
+            base_url=LLM_API_BASE_URL,
+            reasoning_effort="low",
             temperature=0,
+            max_retries=2,
+            max_tokens=MAX_TOKENS
         )
-        print("Modello remoto pronto.\n")
 
-    @property
-    def chat_model(self):
-        """Proprietà in sola lettura per accedere al modello Chat di LangChain."""
-        return self._chat
 
-def get_llm(backend: str = LLM):
-    if backend == "local":
-        return LocalLLM()
-    if backend == "api":
-        return ApiLLM()
-    raise ValueError(f"Backend sconosciuto: {backend!r} (usa 'local' o 'api').")
+def get_llm():
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        print(f"Chiave API mancante: imposta la variabile d'ambiente GROQ_API_KEY.")
+
+    return ApiLLM(api_key) if api_key else LocalLLM()
 
 
 # --- ARCHIVIO VETTORIALE CON CHROMADB ---
@@ -304,12 +295,6 @@ class VectorArchive:
     def __init__(self, collection_name: str = COLLECTION_NAME, persist_dir: str = VECTOR_FOLDER):
         self.collection_name = collection_name
         self.client = chromadb.PersistentClient(path=persist_dir)
-
-        # Elimina collezioni obsolete con lo stesso nome, se esistenti
-        try:
-            self.client.delete_collection(collection_name)
-        except Exception:
-            pass
 
         # Crea una nuova collezione per la sessione corrente
         self.collection = self.client.create_collection(
@@ -375,7 +360,7 @@ class VectorArchive:
                 )
         return documents
 
-    def summarize_theme(self, embedding_manager: EmbeddingManager, theme_query: str, top_k: int = TOP_K_RETRIEVAL) -> Dict[str, str]:
+    def summarize_theme(self,llm, embedding_manager: EmbeddingManager, theme_query: str, top_k: int = TOP_K_RETRIEVAL) -> Dict[str, str]:
         """
         Recupera i chunk più rilevanti per un determinato tema su tutti i documenti e li sintetizza per ciascun file.
         """
@@ -389,7 +374,6 @@ class VectorArchive:
         summaries = {}
         for fname, texts in by_file.items():
             combined_text = "\n\n".join(texts)
-            llm = get_llm()
             response = llm.chat_model.invoke([
                 HumanMessage(content=(
                     f"Riassumi in 3-5 frasi i punti chiave relativi al tema '{theme_query}' "
@@ -399,16 +383,15 @@ class VectorArchive:
             summaries[fname] = response.content
         return summaries
 
-    def build_thematic_report(self, embedding_manager: EmbeddingManager) -> str:
+    def build_thematic_report(self,llm, embedding_manager: EmbeddingManager) -> str:
         sections = []
         for theme_key, theme_query in THEMES.items():
-            llm = get_llm()
             summaries = self.summarize_theme(llm, embedding_manager, theme_query)
             memo = self.build_final_memo(llm, theme_query, summaries)
             sections.append(f"# {theme_key.replace('_', ' ').title()}\n\n{memo}")
         return "\n\n---\n\n".join(sections)
 
-    def build_final_memo(self, query: str, summaries: Dict[str, str]) -> str:
+    def build_final_memo(self,llm , query: str, summaries: Dict[str, str]) -> str:
         if not summaries:
             return "Nessun documento rilevante trovato per la query richiesta."
 
@@ -425,7 +408,6 @@ class VectorArchive:
             )),
             HumanMessage(content=f"Argomento: {query}\n\nRiassunti per documento:\n\n{per_doc_section}"),
         ]
-        llm = get_llm()
         response = llm.chat_model.invoke(messages)
 
         return f"{per_doc_section}\n\n{response.content}"
@@ -439,7 +421,7 @@ class DocumentAnalyzer:
         "criticità, decisioni e raccomandazioni"
     )
 
-    def __init__(self, archive: VectorArchive, embedding_manager: EmbeddingManager):
+    def __init__(self,llm , archive: VectorArchive, embedding_manager: EmbeddingManager):
         self._archive = archive
         self._embedding_manager = embedding_manager
         self._parser = JsonOutputParser(pydantic_object=_LLMAnalysisSchema)
@@ -460,7 +442,6 @@ class DocumentAnalyzer:
                 ),
             ]
         )
-        llm = get_llm()
         self._chain = prompt | llm.chat_model | self._parser
 
     def analyze(self, file_name: str, format: str) -> DocumentAnalysis:
@@ -487,6 +468,7 @@ class DocumentAnalyzer:
             )
 
         category = data.get("category", "Non classificato")
+
         if category not in CATEGORIES:
             category = "Revisione manuale richiesta"
 
@@ -507,10 +489,10 @@ class DocumentAnalyzer:
             detected_entities=data.get("detected_entities") or [],
             critical_issues=data.get("critical_issues") or [],
             recommendation=data.get("recommendation", ""),
-            number_of_chunks_analyzed=len(chunks)
+            number_of_chunks_analyzed=len(chunks),
         )
 
-# PIPELINE 
+# PIPELINE
 class DocumentAnalysisPipeline:
     """Orchestra tutti i componenti ed esegue l'analisi sequenziale sui documenti."""
     def __init__(self):
@@ -520,7 +502,7 @@ class DocumentAnalysisPipeline:
         collection_name = f"{COLLECTION_NAME}_{uuid.uuid4().hex[:8]}"
         self._archive = VectorArchive(collection_name, VECTOR_FOLDER)
         self._llm = get_llm()
-        self._analyzer = DocumentAnalyzer(self._llm, self._archive, self._embedding_manager)
+        self._analyzer = DocumentAnalyzer(self._llm,self._archive, self._embedding_manager)
 
     def run(self) -> List[DocumentAnalysis]:
         print("Recupero dei documenti dalla cartella di destinazione...")

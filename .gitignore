@@ -141,6 +141,8 @@ mnesia/
 rabbitmq/
 rabbitmq-data/
 
+chroma_db
+
 # ActiveMQ
 activemq-data/
 
